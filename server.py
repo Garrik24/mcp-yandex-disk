@@ -1,6 +1,6 @@
 """
 MCP-сервер для Яндекс.Диска.
-Позволяет AI-ассистентам просматривать, искать и скачивать файлы.
+Позволяет AI-ассистентам просматривать, искать, скачивать, загружать и публиковать файлы.
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger("yadisk_mcp")
 
 # --- MCP-сервер ---
 
-mcp = FastMCP("yadisk_mcp")
+mcp = FastMCP("yadisk_mcp", host="0.0.0.0", port=PORT)
 
 # --- HTTP-клиент ---
 
@@ -57,6 +57,53 @@ async def _api_get_raw(url: str) -> bytes:
         resp = await client.get(url)
         resp.raise_for_status()
         return resp.content
+
+
+async def _api_request(method: str, path: str, params: Optional[dict] = None) -> dict:
+    """Запрос к Yandex Disk API произвольным методом (PUT/POST/DELETE)."""
+    url = f"{YANDEX_API_BASE}{path}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.request(method, url, headers=_get_headers(), params=params or {})
+        if resp.status_code == 401:
+            return {"error": "Ошибка авторизации. Проверьте OAuth-токен."}
+        if resp.status_code == 403:
+            return {"error": "Доступ запрещён. У токена нет прав на запись (нужен cloud_api:disk.write)."}
+        if resp.status_code == 404:
+            return {"error": "Ресурс не найден. Проверьте путь."}
+        if resp.status_code == 409:
+            return {"error": "conflict", "detail": resp.json().get("description", "Ресурс уже существует или нет родительской папки.")}
+        if resp.status_code == 507:
+            return {"error": "На Диске недостаточно места."}
+        if resp.status_code >= 400:
+            return {"error": f"Ошибка API: {resp.status_code} — {resp.text[:300]}"}
+        if resp.status_code == 204 or not resp.content:
+            return {"ok": True}
+        return resp.json()
+
+
+async def _ensure_parents(path: str) -> None:
+    """Создать все родительские папки для указанного пути (тихо, без ошибок)."""
+    clean = path.replace("disk:/", "").strip("/")
+    parts = clean.split("/")[:-1]
+    acc = "disk:/"
+    for part in parts:
+        acc = acc.rstrip("/") + "/" + part
+        await _api_request("PUT", "/resources", {"path": acc})
+
+
+async def _upload_bytes(path: str, content: bytes, overwrite: bool) -> dict:
+    """Загрузить байты в файл на Диске: получить href и залить файл."""
+    link = await _api_get("/resources/upload", {"path": path, "overwrite": str(overwrite).lower()})
+    if "error" in link:
+        return link
+    href = link.get("href", "")
+    if not href:
+        return {"error": "Не удалось получить ссылку для загрузки."}
+    async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
+        resp = await client.put(href, content=content)
+        if resp.status_code >= 400:
+            return {"error": f"Ошибка загрузки: {resp.status_code} — {resp.text[:300]}"}
+    return {"ok": True}
 
 
 def _format_resource(item: dict) -> dict:
@@ -170,6 +217,56 @@ class ReadTextFileInput(BaseModel):
         ge=1,
         le=5120,
     )
+
+
+class CreateFolderInput(BaseModel):
+    """Параметры для создания папки."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    path: str = Field(
+        ...,
+        description="Путь создаваемой папки, например 'disk:/Тендеры/AFI Вешки'",
+        min_length=1,
+    )
+    parents: bool = Field(
+        default=True,
+        description="Создавать промежуточные папки, если их нет",
+    )
+
+
+class UploadFileInput(BaseModel):
+    """Параметры для загрузки файла из base64."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    path: str = Field(
+        ...,
+        description="Полный путь файла на Диске, например 'disk:/Тендеры/КП.pdf'",
+        min_length=1,
+    )
+    content_base64: str = Field(
+        ...,
+        description="Содержимое файла в base64",
+        min_length=1,
+    )
+    overwrite: bool = Field(default=True, description="Перезаписать файл, если существует")
+    publish: bool = Field(default=False, description="Сразу опубликовать и вернуть публичную ссылку")
+
+
+class UploadFromUrlInput(BaseModel):
+    """Параметры для загрузки файла по URL силами Яндекс.Диска."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    path: str = Field(..., description="Полный путь файла на Диске", min_length=1)
+    url: str = Field(..., description="Прямая ссылка на файл (http/https)", min_length=1)
+    publish: bool = Field(default=False, description="Опубликовать после загрузки")
+
+
+class PublishInput(BaseModel):
+    """Параметры публикации ресурса."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    path: str = Field(..., description="Путь к файлу или папке на Диске", min_length=1)
+    unpublish: bool = Field(default=False, description="Снять публикацию вместо публикации")
 
 
 # --- Инструменты ---
@@ -440,10 +537,145 @@ async def yadisk_read_text_file(params: ReadTextFileInput) -> str:
         return json.dumps({"error": f"Ошибка при чтении файла: {str(e)}"}, ensure_ascii=False)
 
 
+@mcp.tool(
+    name="yadisk_create_folder",
+    annotations={
+        "title": "Создать папку на Яндекс.Диске",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def yadisk_create_folder(params: CreateFolderInput) -> str:
+    """Создать папку на Яндекс.Диске (при parents=true создаёт и промежуточные папки).
+
+    Args:
+        params (CreateFolderInput): Путь папки и признак создания родителей.
+
+    Returns:
+        str: JSON с результатом.
+    """
+    if params.parents:
+        await _ensure_parents(params.path.rstrip("/") + "/x")
+    data = await _api_request("PUT", "/resources", {"path": params.path})
+    if data.get("error") == "conflict":
+        return json.dumps({"ok": True, "path": params.path, "note": "Папка уже существует"}, ensure_ascii=False)
+    if "error" in data:
+        return json.dumps(data, ensure_ascii=False)
+    return json.dumps({"ok": True, "path": params.path}, ensure_ascii=False)
+
+
+@mcp.tool(
+    name="yadisk_upload_file",
+    annotations={
+        "title": "Загрузить файл на Яндекс.Диск",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def yadisk_upload_file(params: UploadFileInput) -> str:
+    """Загрузить файл на Яндекс.Диск из содержимого в base64.
+
+    Недостающие папки создаются автоматически. При publish=true возвращается публичная ссылка.
+
+    Args:
+        params (UploadFileInput): Путь, содержимое в base64, флаги перезаписи и публикации.
+
+    Returns:
+        str: JSON с результатом и, при необходимости, публичной ссылкой.
+    """
+    import base64
+    try:
+        content = base64.b64decode(params.content_base64)
+    except Exception as e:
+        return json.dumps({"error": f"Некорректный base64: {e}"}, ensure_ascii=False)
+
+    await _ensure_parents(params.path)
+    res = await _upload_bytes(params.path, content, params.overwrite)
+    if "error" in res:
+        return json.dumps(res, ensure_ascii=False)
+
+    out = {"ok": True, "path": params.path, "size_bytes": len(content)}
+    if params.publish:
+        pub = await _api_request("PUT", "/resources/publish", {"path": params.path})
+        if "error" not in pub:
+            info = await _api_get("/resources", {"path": params.path})
+            out["public_url"] = info.get("public_url", "")
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(
+    name="yadisk_upload_from_url",
+    annotations={
+        "title": "Загрузить файл на Диск по ссылке",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def yadisk_upload_from_url(params: UploadFromUrlInput) -> str:
+    """Загрузить файл на Яндекс.Диск по прямой ссылке — скачивает сам Яндекс, без передачи содержимого.
+
+    Args:
+        params (UploadFromUrlInput): Путь на Диске, ссылка, флаг публикации.
+
+    Returns:
+        str: JSON с результатом (операция на стороне Яндекса выполняется асинхронно).
+    """
+    await _ensure_parents(params.path)
+    data = await _api_request("POST", "/resources/upload", {"path": params.path, "url": params.url})
+    if "error" in data:
+        return json.dumps(data, ensure_ascii=False)
+
+    out = {"ok": True, "path": params.path, "operation": data.get("href", "")}
+    if params.publish:
+        pub = await _api_request("PUT", "/resources/publish", {"path": params.path})
+        if "error" not in pub:
+            info = await _api_get("/resources", {"path": params.path})
+            out["public_url"] = info.get("public_url", "")
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(
+    name="yadisk_publish",
+    annotations={
+        "title": "Опубликовать или скрыть ресурс",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def yadisk_publish(params: PublishInput) -> str:
+    """Опубликовать файл или папку и получить публичную ссылку (или снять публикацию).
+
+    Args:
+        params (PublishInput): Путь и режим (публикация либо снятие).
+
+    Returns:
+        str: JSON с публичной ссылкой.
+    """
+    endpoint = "/resources/unpublish" if params.unpublish else "/resources/publish"
+    data = await _api_request("PUT", endpoint, {"path": params.path})
+    if "error" in data:
+        return json.dumps(data, ensure_ascii=False)
+    info = await _api_get("/resources", {"path": params.path})
+    return json.dumps({
+        "ok": True,
+        "path": params.path,
+        "public_url": info.get("public_url", ""),
+        "published": not params.unpublish,
+    }, ensure_ascii=False, indent=2)
+
+
 # --- Запуск ---
 
 if __name__ == "__main__":
     if not YANDEX_OAUTH_TOKEN:
         logger.error("YANDEX_OAUTH_TOKEN не установлен! Сервер не сможет работать.")
     logger.info(f"Запуск yadisk_mcp на порту {PORT}")
-    mcp.run(transport="sse", port=PORT)
+    mcp.run(transport="sse")

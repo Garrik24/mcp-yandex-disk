@@ -41,11 +41,11 @@ MCP-сервер для доступа к Яндекс.Диску через Cla
 2. Подключить к Railway
 3. Установить переменные: `YANDEX_OAUTH_TOKEN`, `PORT=8080`
 4. Railway автоматически задетектит Python и запустит через Procfile
-5. URL сервера будет вида: `https://mcp-yandex-disk-production.up.railway.app/mcp/sse`
+5. URL сервера будет вида: `https://mcp-yandex-disk-production.up.railway.app/sse`
 
 ## Подключение к Claude.ai
 В настройках Claude.ai → Integrations → добавить MCP-сервер:
-- URL: `https://mcp-yandex-disk-production.up.railway.app/mcp/sse`
+- URL: `https://mcp-yandex-disk-production.up.railway.app/sse`
 - Название: `Yandex Disk`
 
 ## Важно
