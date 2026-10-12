@@ -17,13 +17,14 @@ from pydantic import BaseModel, Field, ConfigDict
 YANDEX_OAUTH_TOKEN = os.environ.get("YANDEX_OAUTH_TOKEN", "")
 YANDEX_API_BASE = "https://cloud-api.yandex.net/v1/disk"
 PORT = int(os.environ.get("PORT", "8080"))
+MAX_REQUEST_BODY_SIZE = int(os.environ.get("MAX_REQUEST_BODY_SIZE", str(50 * 1024 * 1024)))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yadisk_mcp")
 
 # --- MCP-сервер ---
 
-mcp = FastMCP("yadisk_mcp", host="0.0.0.0", port=PORT)
+mcp = FastMCP("yadisk_mcp", host="0.0.0.0", port=PORT, max_request_body_size=MAX_REQUEST_BODY_SIZE)
 
 # --- HTTP-клиент ---
 
